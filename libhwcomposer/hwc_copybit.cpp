@@ -23,7 +23,14 @@
 #include <utils/Timers.h>
 #include "hwc_copybit.h"
 #include "comptype.h"
+#include "mdp_version.h"
 #include "gr.h"
+
+#ifdef NO_IOMMU
+#define HEAP_ID GRALLOC_USAGE_PRIVATE_UI_CONTIG_HEAP
+#else
+#define HEAP_ID GRALLOC_USAGE_PRIVATE_IOMMU_HEAP
+#endif
 
 namespace qhwc {
 
@@ -172,7 +179,8 @@ bool CopyBit::prepare(hwc_context_t *ctx, hwc_display_contents_1_t *list,
 
 
     //Allocate render buffers if they're not allocated
-    if (useCopybitForYUV || useCopybitForRGB) {
+    if (ctx->mMDP.version > qdutils::MDP_V4_3 &&
+            (useCopybitForYUV || useCopybitForRGB)) {
         int ret = allocRenderBuffers(mAlignedFBWidth,
                                      mAlignedFBHeight,
                                      HAL_PIXEL_FORMAT_RGBA_8888);
@@ -192,7 +200,10 @@ bool CopyBit::prepare(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         if ((hnd->bufferType == BUFFER_TYPE_VIDEO && useCopybitForYUV) ||
             (hnd->bufferType == BUFFER_TYPE_UI && useCopybitForRGB)) {
             layerProp[i].mFlags |= HWC_COPYBIT;
-            list->hwLayers[i].compositionType = HWC_OVERLAY;
+            if (ctx->mMDP.version <= qdutils::MDP_V4_3)
+                list->hwLayers[i].compositionType = HWC_BLIT;
+            else
+                list->hwLayers[i].compositionType = HWC_OVERLAY;
             mCopyBitDraw = true;
         } else {
             // We currently cannot mix copybit layers with layers marked to
@@ -229,23 +240,38 @@ bool CopyBit::draw(hwc_context_t *ctx, hwc_display_contents_1_t *list,
     // draw layers marked for COPYBIT
     int retVal = true;
     int copybitLayerCount = 0;
+    uint32_t last = 0;
     LayerProp *layerProp = ctx->layerProp[dpy];
+    private_handle_t *renderBuffer;
 
     if(mCopyBitDraw == false) // there is no layer marked for copybit
         return false ;
 
     //render buffer
-    private_handle_t *renderBuffer = getCurrentRenderBuffer();
+    if (ctx->mMDP.version <= qdutils::MDP_V4_3) {
+        last = list->numHwLayers - 1;
+        renderBuffer = (private_handle_t *)list->hwLayers[last].handle;
+    } else {
+        renderBuffer = getCurrentRenderBuffer();
+    }
     if (!renderBuffer) {
         ALOGE("%s: Render buffer layer handle is NULL", __FUNCTION__);
         return false;
     }
 
-    //Wait for the previous frame to complete before rendering onto it
-    if(mRelFd[mCurRenderBufferIndex] >=0) {
-        sync_wait(mRelFd[mCurRenderBufferIndex], 1000);
-        close(mRelFd[mCurRenderBufferIndex]);
-        mRelFd[mCurRenderBufferIndex] = -1;
+    if (ctx->mMDP.version > qdutils::MDP_V4_3) {
+        //Wait for the previous frame to complete before rendering onto it
+        if(mRelFd[mCurRenderBufferIndex] >=0) {
+            sync_wait(mRelFd[mCurRenderBufferIndex], 1000);
+            close(mRelFd[mCurRenderBufferIndex]);
+            mRelFd[mCurRenderBufferIndex] = -1;
+        }
+    } else {
+        if(list->hwLayers[last].acquireFenceFd >=0) {
+            sync_wait(list->hwLayers[last].acquireFenceFd, 1000);
+            close(list->hwLayers[last].acquireFenceFd);
+            list->hwLayers[last].acquireFenceFd = -1;
+        }
     }
 
     //Clear the visible region on the render buffer
@@ -418,7 +444,7 @@ int  CopyBit::drawLayerUsingCopybit(hwc_context_t *dev, hwc_layer_1_t *layer,
        }
        ALOGE("%s:%d::tmp_w = %d,tmp_h = %d",__FUNCTION__,__LINE__,tmp_w,tmp_h);
 
-       int usage = GRALLOC_USAGE_PRIVATE_IOMMU_HEAP | GRALLOC_USAGE_PRIVATE_UI_CONTIG_HEAP;
+       int usage = HEAP_ID;
 
        if (0 == alloc_buffer(&tmpHnd, tmp_w, tmp_h, fbHandle->format, usage)){
             copybit_image_t tmp_dst;
@@ -515,8 +541,7 @@ int CopyBit::allocRenderBuffers(int w, int h, int f)
     for (int i = 0; i < NUM_RENDER_BUFFERS; i++) {
         if (mRenderBuffer[i] == NULL) {
             ret = alloc_buffer(&mRenderBuffer[i],
-                               w, h, f,
-                               GRALLOC_USAGE_PRIVATE_IOMMU_HEAP | GRALLOC_USAGE_PRIVATE_UI_CONTIG_HEAP);
+                               w, h, f, HEAP_ID);
         }
         if(ret < 0) {
             freeRenderBuffers();
